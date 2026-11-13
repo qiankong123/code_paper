@@ -86,6 +86,10 @@ int main() {
         for (int g = 0; g < num_seg; ++g) if (ch->i[g] == cid) {
             ++cnt; sd += degree[g]; sw += mean_w[g]; if (degree[g] == 0) ++iso;
         }
+        if (cnt == 0) {
+            std::printf("  %-14s %6lld %26s\n", CHANNEL_NAMES[cid], cnt, "（无样本）");
+            continue;
+        }
         std::printf("  %-14s %6lld %9.2f %13.3f %9.1f%%\n",
                     CHANNEL_NAMES[cid], cnt, sd / cnt, sw / cnt, iso / (double)cnt * 100);
     }

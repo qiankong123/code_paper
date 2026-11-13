@@ -30,9 +30,19 @@ common = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(common
 # 生成 R 的专用种子（固定，保证每次运行得到同一份 R）
 R_SEED = common.SEED + 7
 
+# Python/C++ 共享的固定随机矩阵文件（128×7，%.17g 文本，double 可逐位往返）。
+# 两语言都从这里加载同一份 R，避免 numpy PCG64 与 C++ mt19937 生成不同的 R，
+# 进而导致 SimHash 指纹、相似度、图边（ρ/√S 特征）不一致。
+R_PATH = os.path.join(HERE, "random_matrix_R.csv")
+
 
 def make_random_matrix(seed=R_SEED):
-    """固定随机矩阵 R∈ℝ^{128×7}，每个元素取标准正态。"""
+    """固定随机矩阵 R∈ℝ^{128×7}。优先加载共享文件（与 C++ 逐位一致）；
+    缺失时才用固定种子生成（同分布、同参数，但不保证与 C++ 逐位相同）。"""
+    if os.path.exists(R_PATH):
+        R = np.loadtxt(R_PATH, delimiter=",")
+        assert R.shape == (common.FP_BITS, common.NUM_SYMBOLS)
+        return R
     r = common.rng(seed)
     return r.standard_normal((common.FP_BITS, common.NUM_SYMBOLS))
 

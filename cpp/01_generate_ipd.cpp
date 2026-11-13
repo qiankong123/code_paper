@@ -123,6 +123,10 @@ int main() {
     st.put_i("protocol", std::vector<int>{N}, protos);
     std::string pth = out_path("01_connections.bin");
     st.save(pth);
+    {
+        std::ofstream sf(out_path("data_source.txt").c_str(), std::ios::binary);
+        sf << "synthetic\n";
+    }
     std::cout << "\n已保存：" << pth << "\n";
     return 0;
 }

@@ -79,6 +79,17 @@ inline std::string out_path(const std::string& f) {
     ensure_out_dir();
     return out_dir() + "/" + f;
 }
+// 读取数据来源标记 outputs/data_source.txt
+// （01_generate_ipd 写 synthetic；01_load_caida 写 CAIDA/<subset>）。缺省视为 synthetic。
+inline std::string get_data_source() {
+    std::ifstream f((out_dir() + "/data_source.txt").c_str());
+    std::string s;
+    if (f) std::getline(f, s); else s = "synthetic";
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' '))
+        s.pop_back();
+    if (s.empty()) s = "synthetic";
+    return s;
+}
 inline void init_console() {
 #ifdef _WIN32
     SetConsoleOutputCP(65001);

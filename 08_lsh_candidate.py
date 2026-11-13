@@ -126,7 +126,11 @@ def main():
     n_legit = int((seg_channel == 0).sum()); ll_total = n_legit * (n_legit - 1) // 2
     print(f"  合法-合法对召回 = {ll}/{ll_total} = {ll/ll_total*100:.1f}%")
     for cid in range(1, len(fp["channel_names"])):
-        tot = n_legit * int((seg_channel == cid).sum())
+        n_c = int((seg_channel == cid).sum())
+        tot = n_legit * n_c
+        if tot == 0:
+            print(f"  合法-{str(fp['channel_names'][cid]):14s} 无样本，跳过")
+            continue
         hit = sum(1 for (i, j) in cand
                   if (seg_channel[i] == 0 and seg_channel[j] == cid) or
                   (seg_channel[j] == 0 and seg_channel[i] == cid))

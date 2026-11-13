@@ -35,13 +35,14 @@ m07 = _load("07_robust_aggregation")
 
 
 def main():
+    # 05 指纹
     fp = common.load_npz("05_fingerprints.npz", allow_pickle=True)
     H32, H64, H128 = fp["H32"], fp["H64"], fp["H128"]
     seg_channel = fp["seg_channel"]; seg_label = fp["seg_label"]
-
+    # 08 候选
     cand = common.load_npz("08_candidates.npz", allow_pickle=True)
     candidates = cand["candidates"]
-    num_seg = H32.shape[0]
+    num_seg = H32.shape[0] #段数量（一段2000个IPD）
 
     common.banner("09 阈值标定、边分流与建图")
 
@@ -54,11 +55,17 @@ def main():
         if (t + 1) % 300 == 0:
             print(f"  已计算 {t+1}/{len(candidates)} 个候选对 ...")
     rec = np.array(rec)
+    if len(rec) == 0:
+        raise RuntimeError("LSH 候选对为 0（真实指纹相似度过低），无法建图；"
+                           "请检查 IPD 清洗/尺度，或放宽 08 的证据阈值。")
 
     # 2) 在合法-合法对上标定 θ0/θ1（Q0.30/Q0.60）
     ll_mask = (seg_channel[rec[:, 0].astype(int)] == 0) & \
               (seg_channel[rec[:, 1].astype(int)] == 0)
     ll_m = rec[ll_mask, 5]
+    if ll_m.size == 0:
+        raise RuntimeError("没有合法-合法候选对，无法在合法分布上标定 θ0/θ1；"
+                           "请增加合法连接数或检查真实数据清洗。")
     theta0 = float(np.quantile(ll_m, common.THETA_LO_Q))
     theta1 = float(np.quantile(ll_m, common.THETA_HI_Q))
     print(f"\n合法-合法候选对 m 分布：min={ll_m.min():.3f}, "
@@ -91,6 +98,9 @@ def main():
     chnames = fp["channel_names"]
     for cid, name in enumerate(chnames):
         ix = np.where(seg_channel == cid)[0]
+        if len(ix) == 0:
+            print(f"{str(name):14s}{'0':>7s}    （无样本）")
+            continue
         iso = np.mean(degree[ix] == 0) * 100
         print(f"{str(name):14s}{len(ix):7d}{degree[ix].mean():9.2f}"
               f"{mean_w[ix].mean():13.3f}{iso:9.1f}%")
@@ -104,8 +114,9 @@ def main():
         "09_graph.npz",
         theta=np.array([theta0, theta1]),
         edges=edges, edge_type=edge_type, X=X, A=A,
-        seg_label=seg_label, seg_channel=seg_channel,
-        seg_conn_id=fp["seg_conn_id"], seg_index=fp["seg_index"],
+        seg_label=seg_label, #零是正常，一是异常。
+        seg_channel=seg_channel,#零是没有方法和流量，一是第一个将方法流量....
+        seg_conn_id=fp["seg_conn_id"], seg_index=fp["seg_index"],# cong05拿到的数据直接存储在09
         channel_names=chnames,
     )
     print(f"\n已保存：{path}")

@@ -3,7 +3,7 @@
 //   (0) 孤立硬规则：ρ=0（大倍率编码）直接判隐蔽；
 //   (1) 第一级 GBDT（召回导向）τ1；(2) 第二级 GBDT（精度导向）τ2。
 //   GBDT = 二分类 logistic 梯度提升 + 深度受限回归树（等价 sklearn GradientBoosting）。
-//   连接级 OOF：fold = conn_id % 5（与 sklearn GroupKFold(5) 同思想、确定性等价）。
+//   连接级 OOF：复刻 sklearn GroupKFold(5, shuffle=False) 的连接→折贪心分配。
 #include "common.hpp"
 
 static const int RHO = 2;
@@ -119,16 +119,56 @@ public:
     }
 };
 
-// 连接级 out-of-fold 概率（fold = conn % 5）
+// 复刻 sklearn GroupKFold(n_splits=5, shuffle=False) 的“组→折”分配，
+// 返回每个元素（段）所属折。算法（见 sklearn _split.py GroupKFold）：
+//   unique 组按出现数（组权重）降序排列（等权重时组号降序），
+//   再贪心把每组放入当前样本数最少的折（argmin 取最小折号）。
+// 必须与 sklearn 一致：早期用 conn%5 的“算术交错”会使折类别分布失衡，
+// 导致第二级 OOF 概率校准偏移、τ2 过严（实测召回由 0.94 掉到 0.55）。
+static std::vector<int> group_kfold_assign(const std::vector<int>& groups) {
+    int K = (int)groups.size();
+    std::vector<int> ug = groups;
+    std::sort(ug.begin(), ug.end());
+    ug.erase(std::unique(ug.begin(), ug.end()), ug.end());
+    int G = (int)ug.size();
+    std::vector<int> gidx(K), w(G, 0);
+    for (int k = 0; k < K; ++k) {
+        int gi = (int)(std::lower_bound(ug.begin(), ug.end(), groups[k]) - ug.begin());
+        gidx[k] = gi; ++w[gi];
+    }
+    // np.argsort(w, stable)[::-1]：权重降序，等权重时 group_idx 降序
+    std::vector<int> order(G);
+    for (int g = 0; g < G; ++g) order[g] = g;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (w[a] != w[b]) return w[a] > w[b];
+        return a > b;
+    });
+    std::vector<long long> fold_size(N_FOLD, 0);
+    std::vector<int> g2f(G, 0);
+    for (int i = 0; i < G; ++i) {
+        int g = order[i], lf = 0;
+        for (int f = 1; f < N_FOLD; ++f)
+            if (fold_size[f] < fold_size[lf]) lf = f;   // np.argmin：取最小折号
+        g2f[g] = lf; fold_size[lf] += w[g];
+    }
+    std::vector<int> segfold(K);
+    for (int k = 0; k < K; ++k) segfold[k] = g2f[gidx[k]];
+    return segfold;
+}
+
+// 连接级 out-of-fold 概率（折由 GroupKFold 决定，保证同连接段不跨折）
 static std::vector<double> oof_predict(const std::vector<int>& idx, const Mat& Fall,
                                        const std::vector<int>& yall, const std::vector<int>& conn,
                                        const GBDTConfig& cfg) {
     int K = (int)idx.size();
     std::vector<double> oof(K, 0.5);
+    std::vector<int> groups(K);
+    for (int k = 0; k < K; ++k) groups[k] = conn[idx[k]];
+    std::vector<int> segfold = group_kfold_assign(groups);
     for (int f = 0; f < N_FOLD; ++f) {
         std::vector<int> tr, va;
         for (int k = 0; k < K; ++k)
-            (conn[idx[k]] % N_FOLD == f ? va : tr).push_back(k);
+            (segfold[k] == f ? va : tr).push_back(k);
         if (tr.empty() || va.empty()) continue;
         int npos = 0;
         for (size_t k = 0; k < tr.size(); ++k) npos += yall[idx[tr[k]]];
@@ -151,6 +191,49 @@ static std::vector<double> oof_predict(const std::vector<int>& idx, const Mat& F
         }
     }
     return oof;
+}
+
+// 在 OOF 概率上选“满足 Precision≥min_p 且召回最大”的工作点
+// （扫描 0.01..0.99，步长 0.01；等价 Python np.linspace(0.01,0.99,99)）。
+static double best_precision_threshold(const std::vector<double>& p,
+                                       const std::vector<int>& y, double min_p,
+                                       bool& found, double& out_rec) {
+    found = false;
+    double best_t = 0.0, best_rec = -1.0;
+    int n = (int)p.size();
+    for (int ti = 1; ti <= 99; ++ti) {
+        double t = ti / 100.0;
+        int tp = 0, fp = 0, fn = 0;
+        for (int i = 0; i < n; ++i) {
+            int pred = (p[i] >= t) ? 1 : 0;
+            if (pred == 1 && y[i] == 1) ++tp;
+            else if (pred == 1 && y[i] == 0) ++fp;
+            else if (pred == 0 && y[i] == 1) ++fn;
+        }
+        double prec = tp / (double)std::max(tp + fp, 1);
+        double rec = tp / (double)std::max(tp + fn, 1);
+        if (prec >= min_p && rec > best_rec) { best_rec = rec; best_t = t; found = true; }
+    }
+    out_rec = best_rec;
+    return best_t;
+}
+
+// 召回地板：P≥0.95 工作点召回低于该值时，认为小样本上经验精度被个别边界样本
+// 绑架（第二级召回坍塌），主动放宽到 P≥0.90。真实数据召回 0.75/0.96，不触发。
+static const double REC_FLOOR = 0.30;
+// 论文公式(11)第二级“精度导向”工作点：先争取 P≥0.95，召回坍塌退 P≥0.90，
+// 都不满足时 found=false（调用方退化为 τ1）。
+static double choose_tau2(const std::vector<double>& p,
+                          const std::vector<int>& y,
+                          double& out_target, bool& found) {
+    bool f95 = false, f90 = false;
+    double r95 = -1.0, r90 = -1.0;
+    double t95 = best_precision_threshold(p, y, 0.95, f95, r95);
+    if (f95 && r95 >= REC_FLOOR) { out_target = 0.95; found = true; return t95; }
+    double t90 = best_precision_threshold(p, y, 0.90, f90, r90);
+    if (f90) { out_target = 0.90; found = true; return t90; }
+    if (f95) { out_target = 0.95; found = true; return t95; }
+    found = false; out_target = 0.0; return 0.0;
 }
 
 int main() {
@@ -186,7 +269,7 @@ int main() {
     std::cout << "测试段中孤立节点 " << n_iso_te << " 个 → 直接判隐蔽（大倍率编码）\n";
 
     GBDTConfig c1 = {150, 2, 3, 0.05};
-    GBDTConfig c2 = {40, 2, 8, 0.10};
+    GBDTConfig c2 = {150, 2, 5, 0.05};   // 第二级也是强模型；“精度”由更高阈值 τ2 保证
 
     // 第一级 OOF
     std::vector<int> ytr_c(clique_idx.size());
@@ -216,34 +299,59 @@ int main() {
     double tau1 = quantile_vec(p1_pos, 0.01);
     std::printf("\n第一级 τ1 = %.4f（团内正类 OOF 概率 1%% 分位，召回导向）\n", tau1);
 
-    // 第二级：候选（p1_oof>=tau1）
-    std::vector<int> cand_idx;
-    for (size_t k = 0; k < clique_idx.size(); ++k)
-        if (p1_oof[k] >= tau1) cand_idx.push_back(clique_idx[k]);
-    std::vector<int> ytr_cand(cand_idx.size());
-    int npos = 0;
-    for (size_t k = 0; k < cand_idx.size(); ++k) { ytr_cand[k] = y[cand_idx[k]]; npos += y[cand_idx[k]]; }
+    // 第二级：在同一团内训练集上训练（不再只在第一级候选子集，避免先验偏斜
+    // 把难分合法的概率顶高、反过来否决第一级已识别的大倍率信道）。
+    // 第二级也用强模型；“精度”由更高阈值 τ2 保证，推理时仍按公式(11)串联。
+    int npos_c = 0, nneg_c = 0;
+    for (size_t k = 0; k < clique_idx.size(); ++k) {
+        if (ytr_c[k] == 1) ++npos_c; else ++nneg_c;
+    }
     double tau2 = tau1;
     std::vector<double> p2_oof;
     GBDT second;
-    bool two_class = npos > 0 && npos < (int)cand_idx.size();
+    bool two_class = npos_c > 0 && nneg_c > 0;
+    double target_p = -1.0;
     if (two_class) {
-        p2_oof = oof_predict(cand_idx, F, y, cn, c2);
-        Mat Xtr((int)cand_idx.size(), 4);
-        for (size_t k = 0; k < cand_idx.size(); ++k)
-            for (int q = 0; q < 4; ++q) Xtr.at((int)k, q) = F.get(cand_idx[k], q);
-        second.fit(Xtr, ytr_cand, c2);
-        std::vector<double> p2_legit, p2_pos;
-        for (size_t k = 0; k < cand_idx.size(); ++k)
-            (ytr_cand[k] == 0 ? p2_legit : p2_pos).push_back(p2_oof[k]);
-        std::sort(p2_legit.begin(), p2_legit.end());
-        tau2 = quantile_vec(p2_legit, 0.99);
-        std::printf("第二级 τ2 = %.4f（候选中合法 OOF 概率 99%% 分位，精度导向）\n", tau2);
-        std::printf("    候选合法 OOF pro2 中位 %.3f/最大 %.3f；候选隐蔽 OOF pro2 中位 %.3f\n",
-                    median_vec(p2_legit), p2_legit.back(), median_vec(p2_pos));
+        p2_oof = oof_predict(clique_idx, F, y, cn, c2);
+        {
+            Mat Xtr((int)clique_idx.size(), 4);
+            for (size_t k = 0; k < clique_idx.size(); ++k)
+                for (int q = 0; q < 4; ++q) Xtr.at((int)k, q) = F.get(clique_idx[k], q);
+            second.fit(Xtr, ytr_c, c2);
+        }
+        sub_banner("团内第二级 OOF 概率按类别（min/中位/max）");
+        std::cout << "类别              n     min     中位     max\n";
+        for (int cid = 0; cid < 6; ++cid) {
+            std::vector<double> v;
+            for (size_t k = 0; k < clique_idx.size(); ++k)
+                if (chh[clique_idx[k]] == cid) v.push_back(p2_oof[k]);
+            if (v.empty()) continue;
+            std::sort(v.begin(), v.end());
+            std::printf("  %-14s %4d %8.3f %8.3f %8.3f\n", CHANNEL_NAMES[cid],
+                        (int)v.size(), v.front(), median_vec(v), v.back());
+        }
+        bool found = false;
+        tau2 = choose_tau2(p2_oof, ytr_c, target_p, found);
+        if (!found) { tau2 = tau1; target_p = -1.0; }
+        if (target_p > 0) {
+            int tp2 = 0, fp2 = 0, fn2 = 0;
+            for (size_t k = 0; k < clique_idx.size(); ++k) {
+                int pred = (p2_oof[k] >= tau2) ? 1 : 0;
+                if (pred == 1 && ytr_c[k] == 1) ++tp2;
+                else if (pred == 1 && ytr_c[k] == 0) ++fp2;
+                else if (pred == 0 && ytr_c[k] == 1) ++fn2;
+            }
+            double pr2 = tp2 / (double)std::max(tp2 + fp2, 1);
+            double rc2 = tp2 / (double)std::max(tp2 + fn2, 1);
+            std::printf("第二级 τ2 = %.4f（OOF 上 Precision≥%.2f、召回最大；该点训练侧 P=%.3f R=%.3f）\n",
+                        tau2, target_p, pr2, rc2);
+        } else {
+            std::printf("第二级无满足精度约束的工作点，退化为 τ1=%.4f\n", tau1);
+        }
     } else {
-        std::cout << "（候选仅含单类，第二级退化为复用第一级）\n";
+        std::cout << "（团内训练集仅含单类，第二级退化为复用第一级）\n";
         second = first;
+        p2_oof = p1_oof;
     }
 
     // ---- 测试级联 ----
@@ -258,18 +366,18 @@ int main() {
         pro1[t] = first.predict_one(row, 0);
         bool iso = iso_te_all[g];
         iso_t[t] = iso ? 1 : 0;
-        if (iso) { final[t] = 1; }
-        else if (pro1[t] < tau1) { final[t] = 0; ++n_direct_normal; }
-        else {
-            ++n_cand;
-            if (two_class) {
-                double p2v = second.predict_one(row, 0);
-                pro2[t] = p2v;
+        if (iso) {
+            final[t] = 1;
+        } else {
+            // 第二级在全团内训练，可对所有非孤立段打分
+            double p2v = two_class ? second.predict_one(row, 0) : pro1[t];
+            pro2[t] = p2v;
+            if (pro1[t] < tau1) { final[t] = 0; ++n_direct_normal; }
+            else {
+                ++n_cand;
                 final[t] = (p2v >= tau2) ? 1 : 0;
-            } else {
-                final[t] = 1;
+                if (final[t] == 1) ++n_cand_pos;
             }
-            if (final[t] == 1) ++n_cand_pos;
         }
     }
 

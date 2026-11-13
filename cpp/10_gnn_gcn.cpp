@@ -35,6 +35,25 @@ static Mat build_P(const Mat& A) {
     return P;
 }
 
+// 从 Python/C++ 共享 CSV 加载 rows×cols 矩阵（逗号分隔，%.17g）。
+static bool load_csv(const char* path, Mat& M, int rows, int cols) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    int rr = 0;
+    while (rr < rows && std::getline(f, line)) {
+        int cc = 0; size_t st = 0;
+        for (size_t i = 0; i <= line.size() && cc < cols; ++i) {
+            if (i == line.size() || line[i] == ',') {
+                M.at(rr, cc) = std::strtod(line.substr(st, i - st).c_str(), NULL);
+                ++cc; st = i + 1;
+            }
+        }
+        ++rr;
+    }
+    return rr == rows;
+}
+
 int main() {
     init_console();
     Store g = Store::load(out_path("09_graph.bin"));
@@ -75,11 +94,16 @@ int main() {
 
     // ---------- 真实图训练 ----------
     Mat P = build_P(A);
-    RNG r(SEED + 11);
     Mat W0(2, H_DIM), W1(H_DIM, H_DIM);
     std::vector<double> b0(H_DIM, 0), b1(H_DIM, 0);
-    for (int q = 0; q < 2 * H_DIM; ++q) W0.a[q] = r.standard_normal() * 0.5;
-    for (int q = 0; q < H_DIM * H_DIM; ++q) W1.a[q] = r.standard_normal() * 0.3;
+    bool w_from_csv = load_csv("../gcn_W0_init.csv", W0, 2, H_DIM)
+                   && load_csv("../gcn_W1_init.csv", W1, H_DIM, H_DIM);
+    if (!w_from_csv) {
+        std::cerr << "[警告] 未找到 ../gcn_W0/W1_init.csv，回退 mt19937 初始化（与 Python 不一致）。\n";
+        RNG r(SEED + 11);
+        for (int q = 0; q < 2 * H_DIM; ++q) W0.a[q] = r.standard_normal() * 0.5;
+        for (int q = 0; q < H_DIM * H_DIM; ++q) W1.a[q] = r.standard_normal() * 0.3;
+    }
 
     std::vector<int> eu(E), ev(E);
     std::vector<double> tw(E);

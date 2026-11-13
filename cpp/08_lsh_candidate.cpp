@@ -133,6 +133,7 @@ int main() {
               << ll / (double)ll_total * 100 << "%\n";
     for (int cid = 1; cid <= 5; ++cid) {
         int nc = 0; for (int g = 0; g < num_seg; ++g) if (ch->i[g] == cid) ++nc;
+        if (nc == 0) continue;                 // 本数据集无该类（真实数据缺 ε）
         long long tot = (long long)n_legit * nc;
         int hit = count_pair(cid);
         std::printf("  合法-%-14s 保留 %5d/%-5d = %5.1f%%\n",

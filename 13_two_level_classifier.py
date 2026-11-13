@@ -42,7 +42,8 @@ def oof_proba(model, X, y, groups):
 
 
 def best_precision_threshold(p, y, min_precision=0.97):
-    """在 OOF 概率上选阈值：满足 precision≥min_precision 前提下召回最大。"""
+    """在 OOF 概率上选阈值：满足 precision≥min_precision 前提下召回最大。
+    返回 (阈值, 召回, 精度)，找不到返回 None。"""
     best = None
     for t in np.linspace(0.01, 0.99, 99):
         pred = (p >= t).astype(int)
@@ -53,7 +54,27 @@ def best_precision_threshold(p, y, min_precision=0.97):
         recall = tp / max(tp + fn, 1)
         if precision >= min_precision and (best is None or recall > best[1]):
             best = (t, recall, precision)
-    return best[0] if best else None
+    return best
+
+
+# 精度导向工作点的召回地板：当 P≥0.95 工作点的召回低于该值时，认为高阈值在
+# 小样本上被一两个边界样本“绑架”（经验精度虚高、第二级召回坍塌），主动放宽到
+# P≥0.90。真实数据（召回 0.75/0.96）远高于地板，不会触发；仅小规模合成数据触发。
+REC_FLOOR = 0.30
+
+
+def choose_precision_operating_point(p, y):
+    """论文公式(11)第二级“精度导向”阈值：先争取 P≥0.95，召回坍塌时退 P≥0.90。
+    返回 (tau2, target_precision)；都无法满足返回 (None, None)。"""
+    b95 = best_precision_threshold(p, y, 0.95)
+    if b95 is not None and b95[1] >= REC_FLOOR:
+        return b95[0], 0.95
+    b90 = best_precision_threshold(p, y, 0.90)
+    if b90 is not None:
+        return b90[0], 0.90
+    if b95 is not None:
+        return b95[0], 0.95
+    return None, None
 
 
 def main():
@@ -77,7 +98,11 @@ def main():
           f"团内 {len(ytr)} 段训练 GBDT），测试段 {len(yte)}")
     print(f"测试段中孤立节点 {int(iso_te.sum())} 个 → 直接判隐蔽（大倍率编码）")
 
-    # ---- 团内两级 GBDT ----
+    # ---- 团内两级 GBDT（第一级召回导向、第二级精度导向）----
+    # 两级都在【同一个团内训练集】上训练：第二级若只在第一级候选子集上重训，
+    # 该子集只含"被怀疑的合法 + 隐蔽"，先验偏斜、样本变少，概率校准会被扭曲
+    # （真实 CAIDA 数据上会出现合法 pro2 反被顶高、阈值把大倍率也挡掉）。
+    # 两级推理时仍按论文公式(11)串联：先过 τ1，再对候选过 τ2。
     first = GradientBoostingClassifier(
         n_estimators=150, max_depth=2, min_samples_leaf=3,
         learning_rate=0.05, random_state=common.SEED)
@@ -94,36 +119,44 @@ def main():
     tau1 = float(np.quantile(p1_oof[ytr == 1], 0.01))   # 召回导向
     print(f"\n第一级 τ1 = {tau1:.4f}（团内正类 OOF 概率 1% 分位，召回导向）")
 
-    cand = p1_oof >= tau1
     second = GradientBoostingClassifier(
-        n_estimators=40, max_depth=2, min_samples_leaf=8,
-        learning_rate=0.1, random_state=common.SEED + 1)
-    if len(np.unique(ytr[cand])) == 2:
-        p2_oof = oof_proba(second, Xtr[cand], ytr[cand], gtr[cand])
-        second.fit(Xtr[cand], ytr[cand])
-        # 精度导向：τ2 取候选中【合法段】OOF 第二级概率的 99% 分位，
-        # 即"高于几乎所有看起来可疑的合法段"才判隐蔽，直接保护合法；
-        # 可分的高相似信道（Jitterbug，H_sym 高/L_cy 小）自然越过阈值，
-        # 与合法重叠的 ε 漏检（ε-不可区分的理论代价）。
-        p2_legit = p2_oof[ytr[cand] == 0]
-        p2_jit = p2_oof[ytr[cand] == 1]
-        tau2 = float(np.quantile(p2_legit, 0.99))
-        print(f"第二级 τ2 = {tau2:.4f}（候选中合法 OOF 概率的 99% 分位，精度导向）")
-        print(f"    候选合法 OOF pro2 中位 {np.median(p2_legit):.3f}/最大 {p2_legit.max():.3f}；"
-              f"候选隐蔽 OOF pro2 中位 {np.median(p2_jit):.3f}")
+        n_estimators=150, max_depth=2, min_samples_leaf=5,
+        learning_rate=0.05, random_state=common.SEED + 1)
+    if len(np.unique(ytr)) == 2:
+        p2_oof = oof_proba(second, Xtr, ytr, gtr)
+        second.fit(Xtr, ytr)
+        # 精度导向：第二级 OOF 上争取 Precision≥0.95、召回最大的工作点；
+        # 若该点召回坍塌（小样本上经验精度被个别边界样本绑架，见 REC_FLOOR），
+        # 放宽到 Precision≥0.90；再不行退化为 τ1。论文只规定“第二级精度导向”，
+        # 未给具体阈值；这是数据驱动、且在小样本上不发生召回坍塌的标准标定。
+        tau2, target_p = choose_precision_operating_point(p2_oof, ytr)
+        common.sub_banner("团内第二级 OOF 概率按类别（min/中位/max）")
+        print(f"{'类别':14s}{'n':>4}{'min':>8}{'中位':>8}{'max':>8}")
+        for cid in range(len(chnames)):
+            v = p2_oof[chan[clique_tr] == cid]
+            if len(v):
+                print(f"{str(chnames[cid]):14s}{len(v):4d}{v.min():8.3f}{np.median(v):8.3f}{v.max():8.3f}")
+        if target_p is not None:
+            pred2 = (p2_oof >= tau2).astype(int)
+            tp2 = int(((pred2 == 1) & (ytr == 1)).sum())
+            fp2 = int(((pred2 == 1) & (ytr == 0)).sum())
+            fn2 = int(((pred2 == 0) & (ytr == 1)).sum())
+            pr2 = tp2 / max(tp2 + fp2, 1); rc2 = tp2 / max(tp2 + fn2, 1)
+            print(f"第二级 τ2 = {tau2:.4f}（OOF 上 Precision≥{target_p:.2f}、召回最大；"
+                  f"该点训练侧 P={pr2:.3f} R={rc2:.3f}）")
+        else:
+            print(f"第二级无满足精度约束的工作点，退化为 τ1={tau1:.4f}")
     else:
-        print("（候选仅含单类，第二级退化为复用第一级）")
-        second = first; tau2 = tau1
+        print("（团内训练集仅含单类，第二级退化为复用第一级）")
+        second = first; tau2 = tau1; p2_oof = p1_oof
 
-    # ---- 测试：孤立硬规则 + 团内级联 ----
+    # ---- 测试：孤立硬规则 + 团内级联（公式11：pro1≥τ1 且 pro2≥τ2）----
     p1 = first.predict_proba(Xte)[:, 1]
+    p2 = second.predict_proba(Xte)[:, 1]   # 第二级在全团内训练，可对所有段打分
     final = np.zeros(len(yte), dtype=int)
-    p2 = np.full(len(yte), np.nan)
     final[iso_te] = 1                    # 孤立节点直接判隐蔽
     cand_te = (~iso_te) & (p1 >= tau1)
-    if cand_te.any():
-        p2[cand_te] = second.predict_proba(Xte[cand_te])[:, 1]
-        final[cand_te] = (p2[cand_te] >= tau2).astype(int)
+    final[cand_te] = (p2[cand_te] >= tau2).astype(int)
 
     common.sub_banner("测试级联过程")
     print(f"  测试段总数 {len(yte)}：孤立判隐蔽 {int(iso_te.sum())} 段")
@@ -133,7 +166,7 @@ def main():
     common.sub_banner("测试段判定示例（前 12 个）")
     print(f"{'段':>5}{'真实':>5}{'pro1':>8}{'pro2':>8}{'最终':>5}")
     for t in range(min(12, len(yte))):
-        tag = "孤立" if iso_te[t] else ("—" if np.isnan(p2[t]) else f"{p2[t]:.3f}")
+        tag = "孤立" if iso_te[t] else f"{p2[t]:.3f}"
         print(f"{test_idx[t]:5d}{int(yte[t]):5d}{p1[t]:8.3f}{tag:>8}{int(final[t]):5d}")
 
     with open(common.out_path("13_models.pkl"), "wb") as fpkl:

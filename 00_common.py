@@ -136,6 +136,23 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -60, 60)))
 
 
+def set_data_source(tag):
+    """在 outputs/data_source.txt 写入当前数据来源标记（synthetic / CAIDA:bignet ...）。"""
+    with open(out_path("data_source.txt"), "w", encoding="utf-8") as f:
+        f.write(str(tag) + "\n")
+
+
+def get_data_source(default="synthetic"):
+    """读取当前数据来源标记；不存在时返回 default。"""
+    p = out_path("data_source.txt")
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            tag = f.read().strip()
+        if tag:
+            return tag
+    return default
+
+
 if __name__ == "__main__":
     banner("00_common.py 自检：论文固定参数")
     print(f"段长 L = {SEG_LEN}，段步进 = {SEG_STEP}（重叠 {int(SEG_OVERLAP*100)}%）")

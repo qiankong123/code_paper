@@ -167,4 +167,6 @@ if __name__ == "__main__":
         ipd_list=ipd_list, labels=labels, channel_id=channels,
         protocols=protocols, channel_names=np.array(CHANNEL_NAMES),
     )
+    common.set_data_source("synthetic")
     print(f"\n已保存：{path}")
+    print(f"数据来源标记：{common.out_path('data_source.txt')} = synthetic")

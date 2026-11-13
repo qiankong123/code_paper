@@ -60,8 +60,18 @@ def train(X, A, edges, target_w, seed=common.SEED):
     """Adam 自监督训练，让 φ_uv 逼近边权 target_w。"""
     r = common.rng(seed + 11)
     n, din = X.shape
-    W0 = r.standard_normal((din, H_DIM)) * 0.5; b0 = np.zeros(H_DIM)
-    W1 = r.standard_normal((H_DIM, H_DIM)) * 0.3; b1 = np.zeros(H_DIM)
+    # Python/C++ 共享 GCN 初始权重（消除 PCG64 与 mt19937 的初始化差异，
+    # 否则训练后的 φ 在“是否启用 GNN 边强（β>0）”的弱分离场景会翻转）。
+    W0_path = os.path.join(HERE, "gcn_W0_init.csv")
+    W1_path = os.path.join(HERE, "gcn_W1_init.csv")
+    if os.path.exists(W0_path) and os.path.exists(W1_path):
+        W0 = np.loadtxt(W0_path, delimiter=",")
+        W1 = np.loadtxt(W1_path, delimiter=",")
+        assert W0.shape == (din, H_DIM) and W1.shape == (H_DIM, H_DIM)
+    else:
+        W0 = r.standard_normal((din, H_DIM)) * 0.5
+        W1 = r.standard_normal((H_DIM, H_DIM)) * 0.3
+    b0 = np.zeros(H_DIM); b1 = np.zeros(H_DIM)
     params = [W0, b0, W1, b1]
     P = build_P(A)
     u = edges[:, 0].astype(int); v = edges[:, 1].astype(int)

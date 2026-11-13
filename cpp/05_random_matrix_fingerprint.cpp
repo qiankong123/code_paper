@@ -2,6 +2,27 @@
 // 对应 Python 05_random_matrix_fingerprint.py。R 用固定种子生成、全程冻结。
 #include "common.hpp"
 
+// 从 Python/C++ 共享文件加载固定随机矩阵 R（128 行 × 7 列，逗号分隔 double）。
+// 该文件由 Python 05 以 %.17g 导出，保证两语言 R 逐位一致（消除 RNG 差异）。
+static bool load_R_csv(double R[FP_BITS][NUM_SYMBOLS]) {
+    std::ifstream f("../random_matrix_R.csv");
+    if (!f) return false;
+    std::string line;
+    int row = 0;
+    while (row < FP_BITS && std::getline(f, line)) {
+        int col = 0; size_t st = 0;
+        for (size_t i = 0; i <= line.size() && col < NUM_SYMBOLS; ++i) {
+            if (i == line.size() || line[i] == ',') {
+                std::string tok = line.substr(st, i - st);
+                R[row][col] = std::strtod(tok.c_str(), NULL);
+                ++col; st = i + 1;
+            }
+        }
+        ++row;
+    }
+    return row == FP_BITS;
+}
+
 int main() {
     init_console();
     Store data = Store::load(out_path("04_count_vectors.bin"));
@@ -9,15 +30,23 @@ int main() {
     const char* keys[3] = {"V32", "V64", "V128"};
     int num_seg = Vs[0]->shape[0];
 
-    // 固定随机矩阵 R（128×7，标准正态），按 numpy 行优先顺序连续抽样
-    RNG r(R_SEED);
+    // 固定随机矩阵 R（128×7）：优先加载 Python 共享文件（逐位一致）；
+    // 找不到才回退 mt19937 固定种子生成（同分布，但不与 Python 逐位相同）。
     double R[FP_BITS][NUM_SYMBOLS];
-    for (int k = 0; k < FP_BITS; ++k)
-        for (int q = 0; q < NUM_SYMBOLS; ++q)
-            R[k][q] = r.standard_normal();
+    bool from_csv = load_R_csv(R);
+    if (!from_csv) {
+        std::cerr << "[警告] 未找到 ../random_matrix_R.csv，回退 mt19937 生成 R"
+                     "（与 Python 不逐位一致，建议先由 Python 05 导出共享文件）。\n";
+        RNG r(R_SEED);
+        for (int k = 0; k < FP_BITS; ++k)
+            for (int q = 0; q < NUM_SYMBOLS; ++q)
+                R[k][q] = r.standard_normal();
+    }
 
     banner("05 固定随机矩阵 R 与 128 位 SimHash 指纹");
-    std::cout << "R 形状 = (128, 7)，固定种子 R_SEED = " << R_SEED << "\nR 前 3 行 × 7 列:\n";
+    std::cout << "R 形状 = (128, 7)，来源："
+              << (from_csv ? "共享文件 ../random_matrix_R.csv（与 Python 逐位一致）"
+                           : "mt19937 回退（R_SEED）") << "\nR 前 3 行 × 7 列:\n";
     for (int k = 0; k < 3; ++k) {
         std::cout << "  ";
         for (int q = 0; q < 7; ++q) std::printf("%+6.3f ", R[k][q]);

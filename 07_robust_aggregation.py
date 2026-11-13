@@ -58,10 +58,10 @@ def scale_similarity(Ha, Hb, max_shift=MAX_SHIFT, top_shifts=TOP_SHIFTS):
         mask = (ib >= 0) & (ib < nw)
         if mask.any():
             sims = m06.hamming_similarity(Ha[ia0[mask]], Hb[ib[mask]])
-            shift_scores.append(float(np.median(sims)))
+            shift_scores.append(float(np.median(sims)))#把中位数当做同尺度下同比特窗口下的两个不同段的相似度。
     ss = np.sort(np.asarray(shift_scores))
     k = min(top_shifts, len(ss))
-    return float(ss[-k:].mean())
+    return float(ss[-k:].mean())# 取最大的
 
 
 def three_scale_similarity(H32a, H64a, H128a, H32b, H64b, H128b):
@@ -73,7 +73,9 @@ def three_scale_similarity(H32a, H64a, H128a, H32b, H64b, H128b):
 
 
 def first_id(seg_channel, cid):
-    return int(np.where(seg_channel == cid)[0][0])
+    """返回该类别第一个段索引；无该类样本时返回 None（真实数据可能缺 ε）。"""
+    arr = np.where(seg_channel == cid)[0]
+    return int(arr[0]) if len(arr) else None
 
 
 def main():
@@ -82,18 +84,21 @@ def main():
     seg_channel = data["seg_channel"]; chnames = data["channel_names"]
 
     li = first_id(seg_channel, 0)
-    lj = first_id(seg_channel, 0) + 1
+    lj = (li + 1) if li is not None else None
     ip = first_id(seg_channel, 1)
+    ip2 = (ip + 1) if ip is not None else None
     jt = first_id(seg_channel, 4)
     ep = first_id(seg_channel, 5)
 
-    pairs = [
+    candidate_pairs = [
         ("合法-合法", li, lj),
         ("合法-IPCTC", li, ip),
         ("合法-Jitterbug", li, jt),
         ("合法-εklibur", li, ep),
-        ("IPCTC-IPCTC", ip, first_id(seg_channel, 1) + 1),
+        ("IPCTC-IPCTC", ip, ip2),
     ]
+    pairs = [(t, a, b) for (t, a, b) in candidate_pairs
+             if a is not None and b is not None]
 
     common.banner("07 有限位移对齐 + top 平均：段对三尺度相似度 w1/w2/w3")
     print(f"位移范围 ±{MAX_SHIFT}（窗口步长）；每个位移取窗口相似度中位数，")
@@ -106,8 +111,11 @@ def main():
         rows[tag] = (w1, w2, w3, m)
         print(f"{tag:16s}{w1:9.4f}{w2:9.4f}{w3:9.4f}{m:9.4f}")
 
-    print("\n解读：合法-合法 与 IPCTC-IPCTC 相似度高（同类模式）；")
-    print("      合法-IPCTC 明显低；合法-εklibur 可能接近合法（最隐蔽）。")
+    print("\n解读：同类段对（合法-合法、IPCTC-IPCTC）相似度高，跨类（合法-IPCTC）明显低；")
+    if ep is not None:
+        print("      合法-εklibur 可能接近合法（最隐蔽）。")
+    else:
+        print("      本数据集不含 ε-xlibur，故无“合法-εklibur”演示对。")
 
     save = {}
     for tag, vals in rows.items():

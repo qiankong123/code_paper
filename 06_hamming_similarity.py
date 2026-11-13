@@ -35,7 +35,7 @@ def hamming_bits(Ha, Hb):
 
 def hamming_similarity(Ha, Hb):
     """公式(3)：1 − Ham/128。输入为打包指纹。"""
-    d = hamming_bits(Ha, Hb)
+    d = hamming_bits(Ha, Hb)# 247（位移后数量减少）个指纹不同的位数，122（位移后数量减少）个指纹不同的位数，59（位移后数量减少）个指纹不同的位数
     return 1.0 - d / float(common.FP_BITS)
 
 
@@ -86,4 +86,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()# 这个算法只是演示汉明相似度。它的输出并不会被后面的算法使用。
